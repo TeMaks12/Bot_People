@@ -9,7 +9,7 @@ from aiogram.types import Message
 bot = Bot(os.environ["9127436861:AAFPfoi6nhyZEIrnl7z8CByEoa5cGl2B0uY"])
 dp = Dispatcher()
 OPENROUTER_KEY = os.environ["OPENROUTER_API_KEY"]
-OWNER_ID = int(os.environ["OWNER_ID"])
+OWNER_ID = int(os.environ["5973554102"])
 MODEL = os.getenv("MODEL", "openai/gpt-4o-mini")
 history = []
 
