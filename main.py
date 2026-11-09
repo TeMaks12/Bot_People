@@ -6,11 +6,11 @@ from aiogram import Bot, Dispatcher
 from aiogram.filters import Command
 from aiogram.types import Message
 
-bot = Bot(os.environ["9127436861:AAFPfoi6nhyZEIrnl7z8CByEoa5cGl2B0uY"])
+bot = Bot(os.environ["BOT_TOKEN"])
 dp = Dispatcher()
 OPENROUTER_KEY = os.environ["OPENROUTER_API_KEY"]
-OWNER_ID = int(os.environ["5973554102"])
-MODEL = os.getenv("MODEL", "openai/gpt-4o-mini")
+OWNER_ID = int(os.environ["OWNER_ID"])
+MODEL = os.getenv("MODEL", "google/gemma-4-31b-it:free")
 history = []
 
 
