@@ -17,15 +17,8 @@ OWNER_ID = int(os.environ["OWNER_ID"])
 ALLOWED_IDS = {OWNER_ID} | {int(x) for x in os.getenv("ALLOWED_IDS", "").split(",") if x.strip()}
 HER_NAME = os.environ["HER_NAME"]
 ME_NAME = os.environ["ME_NAME"]
-MODELS = [
-    m.strip()
-    for m in os.getenv(
-        "MODELS",
-        "google/gemma-4-31b-it:free,"
-        "dots-studio/dots3-note-preview:free,"
-        "google/gemma-4-26b-a4b-it:free",
-    ).split(",")
-]
+
+MODEL = "openrouter/free"
 
 BASE = Path(__file__).parent
 CHAT = (BASE / "messages.txt").read_text(encoding="utf-8")[-60000:]
@@ -44,21 +37,19 @@ state = {"profile": ""}
 
 
 async def ask(messages, temperature=0.9, max_tokens=400):
-    last_error = None
-    for model in MODELS:
-        try:
-            response = await client.chat.completions.create(
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-            )
-            text = response.choices[0].message.content
-            if text and text.strip():
-                return text.strip()
-        except Exception as e:
-            last_error = e
-    raise RuntimeError(last_error)
+    try:
+        response = await client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        text = response.choices[0].message.content
+        if text and text.strip():
+            return text.strip()
+        raise RuntimeError("пустой ответ от модели")
+    except Exception as e:
+        raise RuntimeError(f"Ошибка API: {e}")
 
 
 async def build_profile():
@@ -130,10 +121,11 @@ async def chat(m: Message):
     await bot.send_chat_action(m.chat.id, "typing")
     try:
         reply = await ask([{"role": "system", "content": system_prompt()}, *history])
-    except Exception:
+    except Exception as e:
         history.pop()
-        await m.answer("ошибка API, попробуй ещё раз")
+        await m.answer(f"ошибка API: {e}")
         return
+    
     history.append({"role": "assistant", "content": reply})
     parts = [p.strip() for p in reply.split("\n") if p.strip()][:MAX_PARTS]
     for part in parts:
