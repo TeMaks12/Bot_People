@@ -18,7 +18,7 @@ ALLOWED_IDS = {OWNER_ID} | {int(x) for x in os.getenv("ALLOWED_IDS", "").split("
 HER_NAME = os.environ["HER_NAME"]
 ME_NAME = os.environ["ME_NAME"]
 
-MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+MODEL = "google/gemma-4-31b-it:free"
 
 BASE = Path(__file__).parent
 CHAT = (BASE / "messages.txt").read_text(encoding="utf-8")[-60000:]
@@ -36,7 +36,7 @@ histories = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
 state = {"profile": ""}
 
 
-async def ask(messages, temperature=0.9, max_tokens=2000):
+async def ask(messages, temperature=0.9, max_tokens=3000):
     try:
         response = await client.chat.completions.create(
             model=MODEL,
