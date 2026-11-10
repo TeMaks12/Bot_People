@@ -36,18 +36,20 @@ histories = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
 state = {"profile": ""}
 
 
-async def ask(messages, temperature=0.9, max_tokens=400):
+async def ask(messages, temperature=0.9, max_tokens=2000):
     try:
         response = await client.chat.completions.create(
             model=MODEL,
             messages=messages,
             temperature=temperature,
             max_tokens=max_tokens,
+            extra_body={"reasoning": {"exclude": True}},
         )
-        text = response.choices[0].message.content
+        choice = response.choices[0]
+        text = choice.message.content
         if text and text.strip():
             return text.strip()
-        raise RuntimeError("пустой ответ от модели")
+        raise RuntimeError(f"пустой ответ от модели (finish_reason={choice.finish_reason})")
     except Exception as e:
         raise RuntimeError(f"Ошибка API: {e}")
 
@@ -61,7 +63,7 @@ async def build_profile():
         "фирменные слова и обороты, опечатки); темы, интересы, внутренние шутки; "
         f"как она общается с {ME_NAME}. Только факты из переписки, ничего не выдумывай."
     )
-    text = await ask([{"role": "user", "content": prompt}], temperature=0.3, max_tokens=1800)
+    text = await ask([{"role": "user", "content": prompt}], temperature=0.3, max_tokens=6000)
     PROFILE_FILE.write_text(text, encoding="utf-8")
     return text
 
@@ -125,7 +127,7 @@ async def chat(m: Message):
         history.pop()
         await m.answer(f"ошибка API: {e}")
         return
-    
+
     history.append({"role": "assistant", "content": reply})
     parts = [p.strip() for p in reply.split("\n") if p.strip()][:MAX_PARTS]
     for part in parts:
@@ -138,7 +140,10 @@ async def main():
     if PROFILE_FILE.exists():
         state["profile"] = PROFILE_FILE.read_text(encoding="utf-8")
     else:
-        state["profile"] = await build_profile()
+        try:
+            state["profile"] = await build_profile()
+        except Exception as e:
+            print(f"profile build failed: {e}")
     await dp.start_polling(bot)
 
 
