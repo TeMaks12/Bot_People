@@ -18,7 +18,7 @@ ALLOWED_IDS = {OWNER_ID} | {int(x) for x in os.getenv("ALLOWED_IDS", "").split("
 HER_NAME = os.environ["HER_NAME"]
 ME_NAME = os.environ["ME_NAME"]
 
-MODEL = "google/gemma-4-31b-it:free"
+MODEL = "thinkingmachines/inkling-2-small:free"
 
 BASE = Path(__file__).parent
 CHAT = (BASE / "messages.txt").read_text(encoding="utf-8")[-60000:]
