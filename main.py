@@ -18,13 +18,21 @@ ALLOWED_IDS = {OWNER_ID} | {int(x) for x in os.getenv("ALLOWED_IDS", "").split("
 HER_NAME = os.environ["HER_NAME"]
 ME_NAME = os.environ["ME_NAME"]
 
-MODEL = "liquid/lfm-3-1.7b:free"
+MODEL = os.getenv("MODEL", "recursive/flint-v1.0:free")
 
 BASE = Path(__file__).parent
-CHAT = (BASE / "messages.txt").read_text(encoding="utf-8")[-60000:]
+CHAT = (BASE / "messages.txt").read_text(encoding="utf-8")[-15000:]
 PROFILE_FILE = BASE / "profile.txt"
 MAX_HISTORY = 20
 MAX_PARTS = 6
+DEBOUNCE = 2.5
+
+REMINDER = (
+    f"Напоминание: ты {HER_NAME}. Следи за ходом диалога. "
+    "Если ты уже о чём-то спросила и собеседник ответил, не спрашивай это снова. "
+    "Не повторяй свои прошлые реплики. Не заканчивай каждое сообщение вопросом «а ты?». "
+    "Отвечай по смыслу на последнее сообщение собеседника, развивай тему или предложи свою."
+)
 
 client = AsyncOpenAI(
     base_url="https://openrouter.ai/api/v1",
@@ -33,10 +41,12 @@ client = AsyncOpenAI(
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 histories = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
+pending = defaultdict(list)
+locks = defaultdict(asyncio.Lock)
 state = {"profile": ""}
 
 
-async def ask(messages, temperature=0.9, max_tokens=3000):
+async def ask(messages, temperature=0.7, max_tokens=3000):
     try:
         response = await client.chat.completions.create(
             model=MODEL,
@@ -80,6 +90,9 @@ def system_prompt():
 Правила:
 - Копируй длину сообщений, регистр, пунктуацию, сленг, мат, эмодзи, опечатки и ритм из переписки.
 - Реагируй эмоционально так, как отреагировала бы {HER_NAME}, исходя из настроения собеседника.
+- Следи за ходом диалога: если ты уже о чём-то спросила и собеседник ответил, не спрашивай это снова.
+- Не повторяй свои прошлые реплики и не заканчивай каждое сообщение вопросом.
+- Отвечай по смыслу на последнее сообщение собеседника, развивай тему или предлагай свою.
 - Если {HER_NAME} обычно пишет несколькими короткими сообщениями, раздели ответ переносами строк: каждая строка уйдёт отдельным сообщением.
 - Пиши только реплики {HER_NAME}, без подписей, имён и пояснений.
 - Не выдумывай факты, которых нет в переписке; уходи от ответа так, как сделала бы она.
@@ -118,22 +131,34 @@ async def rebuild(m: Message):
 async def chat(m: Message):
     if not allowed(m):
         return
-    history = histories[m.chat.id]
-    history.append({"role": "user", "content": m.text})
-    await bot.send_chat_action(m.chat.id, "typing")
-    try:
-        reply = await ask([{"role": "system", "content": system_prompt()}, *history])
-    except Exception as e:
-        history.pop()
-        await m.answer(f"ошибка API: {e}")
-        return
-
-    history.append({"role": "assistant", "content": reply})
-    parts = [p.strip() for p in reply.split("\n") if p.strip()][:MAX_PARTS]
-    for part in parts:
+    pending[m.chat.id].append(m.text)
+    await asyncio.sleep(DEBOUNCE)
+    async with locks[m.chat.id]:
+        texts = pending.pop(m.chat.id, [])
+        if not texts:
+            return
+        history = histories[m.chat.id]
+        history.append({"role": "user", "content": "\n".join(texts)})
         await bot.send_chat_action(m.chat.id, "typing")
-        await asyncio.sleep(min(len(part) * 0.05, 3) + random.random() * 0.5)
-        await m.answer(part)
+        try:
+            reply = await ask(
+                [
+                    {"role": "system", "content": system_prompt()},
+                    *history,
+                    {"role": "system", "content": REMINDER},
+                ]
+            )
+        except Exception as e:
+            history.pop()
+            await m.answer(f"ошибка API: {e}")
+            return
+
+        history.append({"role": "assistant", "content": reply})
+        parts = [p.strip() for p in reply.split("\n") if p.strip()][:MAX_PARTS]
+        for part in parts:
+            await bot.send_chat_action(m.chat.id, "typing")
+            await asyncio.sleep(min(len(part) * 0.05, 3) + random.random() * 0.5)
+            await m.answer(part)
 
 
 async def main():
