@@ -55,7 +55,7 @@ PROFILE_FILE = BASE / "profile.txt"
 DATA_FILE = BASE / "data.json"
 MAX_HISTORY = 20
 MAX_PARTS = 6
-DEBOUNCE = 2.5
+DEBOUNCE = 0
 
 REMINDER = (
     f"Напоминание: ты {HER_NAME}. Следи за ходом диалога. "
