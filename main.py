@@ -1,12 +1,15 @@
 import asyncio
+import json
 import os
 import random
 from collections import defaultdict, deque
+from contextlib import suppress
 from pathlib import Path
 
-from aiogram import Bot, Dispatcher, F
-from aiogram.filters import Command
-from aiogram.types import Message
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.filters import Command, CommandObject
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
 
@@ -14,15 +17,16 @@ load_dotenv()
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_ID = int(os.environ["OWNER_ID"])
-ALLOWED_IDS = {OWNER_ID} | {int(x) for x in os.getenv("ALLOWED_IDS", "").split(",") if x.strip()}
 HER_NAME = os.environ["HER_NAME"]
 ME_NAME = os.environ["ME_NAME"]
 
-MODEL = os.getenv("MODEL", "recursive/flint-v1.0:free")
+MODEL = os.getenv("MODEL", "nvidia/nemotron-3.5-super-vl:free")
+DENIED_TEXT = "Ты не можешь пользоваться ботом"
 
 BASE = Path(__file__).parent
 CHAT = (BASE / "messages.txt").read_text(encoding="utf-8")[-15000:]
 PROFILE_FILE = BASE / "profile.txt"
+DATA_FILE = BASE / "data.json"
 MAX_HISTORY = 20
 MAX_PARTS = 6
 DEBOUNCE = 2.5
@@ -32,23 +36,86 @@ REMINDER = (
     "Если ты уже о чём-то спросила и собеседник ответил, не спрашивай это снова. "
     "Не повторяй свои прошлые реплики. Не заканчивай каждое сообщение вопросом «а ты?». "
     "Отвечай по смыслу на последнее сообщение собеседника, развивай тему или предложи свою."
+    "Не рассказывай про своё состояние и дела из старой переписки, пока тебя не спросили о конкретном. "
 )
 
-client = AsyncOpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=os.environ["OPENROUTER_API_KEY"],
-)
+
+def load_api_keys():
+    keys = []
+    i = 1
+    while os.getenv(f"OPENROUTER_API_KEY_{i}"):
+        keys.append(os.environ[f"OPENROUTER_API_KEY_{i}"].strip())
+        i += 1
+    return keys
+
+
+API_KEYS = load_api_keys()
+if not API_KEYS:
+    raise RuntimeError("Не найдено ни одного OPENROUTER_API_KEY_1, OPENROUTER_API_KEY_2, ...")
+
+clients = [AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=k) for k in API_KEYS]
+
+data = json.loads(DATA_FILE.read_text(encoding="utf-8")) if DATA_FILE.exists() else {}
+allowed_ids = {int(x) for x in data.get("users", [])}
+state = {
+    "profile": "",
+    "key": min(int(data.get("key", 0)), len(clients) - 1),
+    "username": "",
+    "bot_id": 0,
+}
+
+
+def save_data():
+    DATA_FILE.write_text(
+        json.dumps({"users": sorted(allowed_ids), "key": state["key"]}),
+        encoding="utf-8",
+    )
+
+
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 histories = defaultdict(lambda: deque(maxlen=MAX_HISTORY))
 pending = defaultdict(list)
 locks = defaultdict(asyncio.Lock)
-state = {"profile": ""}
+
+
+def is_group(m: Message):
+    return m.chat.type != "private"
+
+
+def extract_prompt(m: Message):
+    text = (m.text or "").strip()
+    if text.startswith("<"):
+        return text[1:].strip()
+    mention = f"@{state['username']}".lower()
+    if text.lower().startswith(mention):
+        return text[len(mention):].lstrip(" ,:").strip()
+    reply = m.reply_to_message
+    if reply and reply.from_user and reply.from_user.id == state["bot_id"]:
+        return text
+    return None
+
+
+class AccessMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, event_data):
+        user = event.from_user
+        if user and (user.id == OWNER_ID or user.id in allowed_ids):
+            return await handler(event, event_data)
+        if isinstance(event, CallbackQuery):
+            await event.answer(DENIED_TEXT, show_alert=True)
+        elif not is_group(event) or extract_prompt(event) is not None:
+            await event.answer(DENIED_TEXT)
+
+
+dp.message.outer_middleware(AccessMiddleware())
+dp.callback_query.outer_middleware(AccessMiddleware())
+
+is_owner = F.from_user.id == OWNER_ID
 
 
 async def ask(messages, temperature=0.7, max_tokens=3000):
     try:
-        response = await client.chat.completions.create(
+        response = await clients[state["key"]].chat.completions.create(
             model=MODEL,
             messages=messages,
             temperature=temperature,
@@ -61,7 +128,7 @@ async def ask(messages, temperature=0.7, max_tokens=3000):
             return text.strip()
         raise RuntimeError(f"пустой ответ от модели (finish_reason={choice.finish_reason})")
     except Exception as e:
-        raise RuntimeError(f"Ошибка API: {e}")
+        raise RuntimeError(f"Ошибка API (ключ {state['key'] + 1}): {e}")
 
 
 async def build_profile():
@@ -80,6 +147,8 @@ async def build_profile():
 
 def system_prompt():
     return f"""Ты {HER_NAME}. Ты переписываешься в Telegram с {ME_NAME}. Пиши точно как {HER_NAME}.
+ - Переписка выше нужна только как образец стиля. События и факты из неё (учёба, билеты, мама, ссора и т.п.) считай прошлыми: не пересказывай их и не говори о них как о текущих, если собеседник сам не заговорил.
+Отвечай только на то, что собеседник реально написал. Не отвечай на вопросы, которых он не задавал. На пример если пользователь написал "Привет", то можешь написать также приветствие, и спросить и начать какую-то тему для разговора. 
 
 Портрет:
 {state["profile"]}
@@ -99,39 +168,121 @@ def system_prompt():
 - Если собеседник всерьёз спрашивает, бот ли ты, честно ответь, что это бот-пародия."""
 
 
-def allowed(m):
-    return m.from_user is not None and m.from_user.id in ALLOWED_IDS
+def key_text():
+    return f"Текущий ключ: {state['key'] + 1} из {len(clients)}"
+
+
+def key_markup():
+    buttons = [
+        InlineKeyboardButton(
+            text=f"✅ {i + 1}" if i == state["key"] else str(i + 1),
+            callback_data=f"key:{i}",
+        )
+        for i in range(len(clients))
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[buttons[i:i + 5] for i in range(0, len(buttons), 5)])
 
 
 @dp.message(Command("start"))
 async def start(m: Message):
-    if allowed(m):
-        await m.answer("привет")
+    await m.answer("привет.")
+
+
+@dp.message(Command("help"))
+async def help_command(m: Message):
+    if m.from_user.id == OWNER_ID:
+        text = (
+            "/start — начать\n"
+            "/reset — очистить историю\n"
+            "/help — список команд\n"
+            "/rebuild — пересобрать профиль\n"
+            "/key — выбрать API-ключ\n"
+            "/adduser <id> — добавить пользователя\n"
+            "/deluser <id> — удалить пользователя\n"
+            "/users — список пользователей"
+        )
+    else:
+        text = (
+            "/start — начать\n"
+            "/reset — очистить историю\n"
+            "/help — список команд"
+        )
+    text += "\n\nВ группах отвечает только на сообщения, начинающиеся с <, или на пинг"
+    await m.answer(text)
 
 
 @dp.message(Command("reset"))
 async def reset(m: Message):
-    if allowed(m):
-        histories[m.chat.id].clear()
-        await m.answer("история очищена")
+    histories[m.chat.id].clear()
+    await m.answer("история очищена")
 
 
-@dp.message(Command("rebuild"))
+@dp.message(Command("rebuild"), is_owner)
 async def rebuild(m: Message):
-    if m.from_user and m.from_user.id == OWNER_ID:
-        await m.answer("пересобираю профиль...")
-        try:
-            state["profile"] = await build_profile()
-            await m.answer("готово")
-        except Exception as e:
-            await m.answer(f"ошибка: {e}")
+    await m.answer("пересобираю профиль...")
+    try:
+        state["profile"] = await build_profile()
+        await m.answer("готово")
+    except Exception as e:
+        await m.answer(f"ошибка: {e}")
+
+
+@dp.message(Command("key"), is_owner)
+async def key_menu(m: Message):
+    await m.answer(key_text(), reply_markup=key_markup())
+
+
+@dp.callback_query(F.data.startswith("key:"), is_owner)
+async def key_select(c: CallbackQuery):
+    index = int(c.data.split(":")[1])
+    if index >= len(clients):
+        await c.answer("Нет такого ключа")
+        return
+    state["key"] = index
+    save_data()
+    with suppress(TelegramBadRequest):
+        await c.message.edit_text(key_text(), reply_markup=key_markup())
+    await c.answer(f"Ключ {index + 1}")
+
+
+@dp.message(Command("adduser"), is_owner)
+async def add_user(m: Message, command: CommandObject):
+    arg = (command.args or "").strip()
+    if not arg.isdigit():
+        await m.answer("/adduser <id>")
+        return
+    allowed_ids.add(int(arg))
+    save_data()
+    await m.answer(f"добавлен: {arg}")
+
+
+@dp.message(Command("deluser"), is_owner)
+async def del_user(m: Message, command: CommandObject):
+    arg = (command.args or "").strip()
+    if not arg.isdigit():
+        await m.answer("/deluser <id>")
+        return
+    allowed_ids.discard(int(arg))
+    save_data()
+    await m.answer(f"удалён: {arg}")
+
+
+@dp.message(Command("users"), is_owner)
+async def list_users(m: Message):
+    lines = [f"{OWNER_ID} (owner)"] + [str(i) for i in sorted(allowed_ids)]
+    await m.answer("\n".join(lines))
 
 
 @dp.message(F.text, ~F.text.startswith("/"))
 async def chat(m: Message):
-    if not allowed(m):
-        return
-    pending[m.chat.id].append(m.text)
+    text = m.text
+    group = is_group(m)
+    if group:
+        text = extract_prompt(m)
+        if not text:
+            return
+    send = m.reply if group else m.answer
+    pending[m.chat.id].append(text)
     await asyncio.sleep(DEBOUNCE)
     async with locks[m.chat.id]:
         texts = pending.pop(m.chat.id, [])
@@ -150,7 +301,7 @@ async def chat(m: Message):
             )
         except Exception as e:
             history.pop()
-            await m.answer(f"ошибка API: {e}")
+            await send(f"ошибка API: {e}")
             return
 
         history.append({"role": "assistant", "content": reply})
@@ -158,10 +309,13 @@ async def chat(m: Message):
         for part in parts:
             await bot.send_chat_action(m.chat.id, "typing")
             await asyncio.sleep(min(len(part) * 0.05, 3) + random.random() * 0.5)
-            await m.answer(part)
+            await send(part)
 
 
 async def main():
+    me = await bot.get_me()
+    state["username"] = me.username
+    state["bot_id"] = me.id
     if PROFILE_FILE.exists():
         state["profile"] = PROFILE_FILE.read_text(encoding="utf-8")
     else:
