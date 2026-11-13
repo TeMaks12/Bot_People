@@ -15,12 +15,38 @@ from openai import AsyncOpenAI
 
 load_dotenv()
 
+PROVIDER = "klinch"  # "openrouter" или "klinch"
+KLINCH_BASE_URL = "https://klinch.cloud/v1"
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 OWNER_ID = int(os.environ["OWNER_ID"])
 HER_NAME = os.environ["HER_NAME"]
 ME_NAME = os.environ["ME_NAME"]
 
-MODEL = os.getenv("MODEL", "nvidia/nemotron-3.5-super-vl:free")
+if PROVIDER not in ("openrouter", "klinch"):
+    raise RuntimeError("PROVIDER должен быть openrouter или klinch")
+
+MODELS_LIST = [
+    "deepseek-flash",
+    "deepseek-v4-pro",
+    "claude-sonnet-5-5",
+    "glm-5",
+    "grok-4.5",
+    "gpt-5.4-mini",
+    "kimi-k2",
+    "mistral-medium",
+    "gemini-3.5-flash",
+]
+DEFAULT_MODEL = "deepseek-flash"
+
+if PROVIDER == "klinch":
+    BASE_URL = KLINCH_BASE_URL
+    KEY_PREFIX = "KLINCH_API_KEY"
+else:
+    BASE_URL = OPENROUTER_BASE_URL
+    KEY_PREFIX = "OPENROUTER_API_KEY"
+
 DENIED_TEXT = "Ты не можешь пользоваться ботом"
 
 BASE = Path(__file__).parent
@@ -43,23 +69,31 @@ REMINDER = (
 def load_api_keys():
     keys = []
     i = 1
-    while os.getenv(f"OPENROUTER_API_KEY_{i}"):
-        keys.append(os.environ[f"OPENROUTER_API_KEY_{i}"].strip())
+    while os.getenv(f"{KEY_PREFIX}_{i}"):
+        keys.append(os.environ[f"{KEY_PREFIX}_{i}"].strip())
         i += 1
     return keys
 
 
 API_KEYS = load_api_keys()
 if not API_KEYS:
-    raise RuntimeError("Не найдено ни одного OPENROUTER_API_KEY_1, OPENROUTER_API_KEY_2, ...")
+    raise RuntimeError(f"Не найдено ни одного {KEY_PREFIX}_1, {KEY_PREFIX}_2, ...")
 
-clients = [AsyncOpenAI(base_url="https://openrouter.ai/api/v1", api_key=k) for k in API_KEYS]
+clients = [AsyncOpenAI(base_url=BASE_URL, api_key=k) for k in API_KEYS]
 
 data = json.loads(DATA_FILE.read_text(encoding="utf-8")) if DATA_FILE.exists() else {}
 allowed_ids = {int(x) for x in data.get("users", [])}
+
+if PROVIDER == "klinch":
+    saved_model = data.get("model", DEFAULT_MODEL)
+    start_model = saved_model if saved_model in MODELS_LIST else DEFAULT_MODEL
+else:
+    start_model = os.getenv("MODEL", "nvidia/nemotron-3.5-super-vl:free")
+
 state = {
     "profile": "",
     "key": min(int(data.get("key", 0)), len(clients) - 1),
+    "model": start_model,
     "username": "",
     "bot_id": 0,
 }
@@ -67,7 +101,7 @@ state = {
 
 def save_data():
     DATA_FILE.write_text(
-        json.dumps({"users": sorted(allowed_ids), "key": state["key"]}),
+        json.dumps({"users": sorted(allowed_ids), "key": state["key"], "model": state["model"]}),
         encoding="utf-8",
     )
 
@@ -115,13 +149,15 @@ is_owner = F.from_user.id == OWNER_ID
 
 async def ask(messages, temperature=0.7, max_tokens=3000):
     try:
-        response = await clients[state["key"]].chat.completions.create(
-            model=MODEL,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            extra_body={"reasoning": {"exclude": True}},
-        )
+        params = {
+            "model": state["model"],
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if PROVIDER == "openrouter":
+            params["extra_body"] = {"reasoning": {"exclude": True}}
+        response = await clients[state["key"]].chat.completions.create(**params)
         choice = response.choices[0]
         text = choice.message.content
         if text and text.strip():
@@ -183,6 +219,23 @@ def key_markup():
     return InlineKeyboardMarkup(inline_keyboard=[buttons[i:i + 5] for i in range(0, len(buttons), 5)])
 
 
+def model_text():
+    return f"Текущая модель: {state['model']}"
+
+
+def model_markup():
+    buttons = [
+        [
+            InlineKeyboardButton(
+                text=f"✅ {name}" if name == state["model"] else name,
+                callback_data=f"model:{i}",
+            )
+        ]
+        for i, name in enumerate(MODELS_LIST)
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
 @dp.message(Command("start"))
 async def start(m: Message):
     await m.answer("привет.")
@@ -197,6 +250,7 @@ async def help_command(m: Message):
             "/help — список команд\n"
             "/rebuild — пересобрать профиль\n"
             "/key — выбрать API-ключ\n"
+            "/model — выбрать модель\n"
             "/adduser <id> — добавить пользователя\n"
             "/deluser <id> — удалить пользователя\n"
             "/users — список пользователей"
@@ -243,6 +297,27 @@ async def key_select(c: CallbackQuery):
     with suppress(TelegramBadRequest):
         await c.message.edit_text(key_text(), reply_markup=key_markup())
     await c.answer(f"Ключ {index + 1}")
+
+
+@dp.message(Command("model"), is_owner)
+async def model_menu(m: Message):
+    if PROVIDER != "klinch":
+        await m.answer(f"Модель задаётся в конфиге: {state['model']}")
+        return
+    await m.answer(model_text(), reply_markup=model_markup())
+
+
+@dp.callback_query(F.data.startswith("model:"), is_owner)
+async def model_select(c: CallbackQuery):
+    index = int(c.data.split(":")[1])
+    if PROVIDER != "klinch" or index >= len(MODELS_LIST):
+        await c.answer("Недоступно")
+        return
+    state["model"] = MODELS_LIST[index]
+    save_data()
+    with suppress(TelegramBadRequest):
+        await c.message.edit_text(model_text(), reply_markup=model_markup())
+    await c.answer(state["model"])
 
 
 @dp.message(Command("adduser"), is_owner)
